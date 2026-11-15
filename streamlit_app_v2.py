@@ -1,8 +1,7 @@
-"""Tissue Regeneration Peptide Navigator — read-only evidence dashboard.
+"""Tissue Regeneration Peptide Navigator — function-first 7-peptide evidence browser.
 
-Deploy main file: streamlit_app_v2.py
-Data build remains separate: python build_database.py --peptide GHK --limit 10
-The Excel is never edited. Unverified automatic extractions are not ranked.
+SQLite source: build_database.py --all --limit 10
+Unverified Europe PMC sentences are never promoted to verified recommendations.
 """
 from __future__ import annotations
 
@@ -15,273 +14,283 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-ROOT = Path(__file__).resolve().parent
-DATABASE = ROOT / "navigator.sqlite3"
-PEPTIDES = {
-    "GHK": "P001", "RADA16-I": "P002", "QK": "P003",
-    "IKVAV": "P004", "KLD-12": "P005", "RGD": "P006", "YIGSR": "P007",
-}
-FUNCTIONS = {"WOUND": "Wound healing", "ANGIO": "Angiogenesis", "NERVE": "Nerve regeneration"}
-MISSING = {"", "not reported", "확인필요", "확인 필요", "nan", "none", "null", "n/a"}
+DB_PATH = Path(__file__).resolve().parent / "navigator.sqlite3"
+PEPTIDES = ("GHK", "RADA16-I", "QK", "IKVAV", "KLD-12", "RGD", "YIGSR")
+PEPTIDE_IDS = {name: f"P{i:03d}" for i, name in enumerate(PEPTIDES, 1)}
+FUNCTIONS = {"WOUND": "Wound healing", "ANGIO": "Angiogenesis", "NERVE": "Nerve regeneration",
+             "CARTILAGE": "Cartilage regeneration", "MIGRATE": "Cell migration", "ADHESION": "Cell adhesion",
+             "PROLIF": "Cell proliferation", "INFLAM": "Inflammatory response", "ECMREMOD": "ECM remodeling"}
+MISSING = {"", "not reported", "nan", "none", "null", "n/a", "확인필요", "확인 필요", "-"}
 
 
-def value(raw):
-    if raw is None:
-        return ""
-    return str(raw).strip()
+def value(x):
+    return "" if x is None else str(x).strip()
 
 
-def meaningful(raw):
-    return value(raw).lower() not in MISSING
+def valid(x):
+    return value(x).lower() not in MISSING
 
 
-def shown(raw):
-    return value(raw) if meaningful(raw) else "확인 필요"
+def show(x):
+    return value(x) if valid(x) else "확인 필요"
 
 
-def doi_id(raw):
-    return re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value(raw), flags=re.I).lower().strip()
+def doi(x):
+    return re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value(x), flags=re.I).lower()
 
 
-def identity(record):
-    """Use DOI first; fall back to study/reference ID. Do not count rows as studies."""
-    doi = doi_id(record.get("DOI"))
-    if doi:
-        return "DOI:" + doi
-    study = value(record.get("Study_ID") or record.get("Reference_ID"))
-    if study:
-        return "STUDY:" + study
-    return ""  # Unknown provenance is not an independent study.
-
-
-def paper_url(record):
-    url = value(record.get("Paper_URL"))
+def link(row):
+    url = value(row.get("Paper_URL") or row.get("paper_url"))
     if url.startswith(("https://", "http://")):
         return url
-    doi = doi_id(record.get("DOI"))
-    return "https://doi.org/" + doi if doi else ""
+    return "https://doi.org/" + doi(row.get("DOI") or row.get("doi")) if doi(row.get("DOI") or row.get("doi")) else ""
 
 
-def classification(record):
-    status = value(record.get("Evidence_Status")).lower()
-    eligibility = value(record.get("Recommendation_Eligibility")).lower()
-    direction = value(record.get("Observed_Direction") or record.get("Effect_Direction")).lower()
-    if "non-significant" in status or "nonsignificant" in status or "no significant" in direction:
-        return "효과 개선 미입증", "통계적으로 유의한 개선이 보고되지 않은 기록"
-    if "unverified" in status or "ineligible" in eligibility or "context only" in eligibility:
-        return "추천 제외 · 맥락", "원문 또는 직접 효능 근거가 부족하거나 추천 대상이 아닌 기록"
-    if "pending" in status or "caveat" in eligibility or "partial" in status:
-        return "검증 필요 후보", "실험 조건·비교군·통계 또는 정량값의 재확인 필요"
-    return "검토 후보", "기존 DB 기록으로, 독립적인 원문 재검증은 완료되지 않음"
+def paper_id(row):
+    d = doi(row.get("DOI") or row.get("doi"))
+    if d:
+        return "DOI:" + d
+    for field in ("PMID", "pmid", "PMCID", "pmcid"):
+        if valid(row.get(field)):
+            return field.upper() + ":" + value(row[field])
+    # No paper ID -> cannot count as a distinct independent publication
+    return ""
 
 
-def join_key(record):
-    return (value(record.get("Variant_ID")), doi_id(record.get("DOI")))
+def kind(row):
+    status = value(row.get("Evidence_Status")).lower()
+    eligibility = value(row.get("Recommendation_Eligibility")).lower()
+    direction = value(row.get("Observed_Direction")).lower()
+    if ("non-significant" in status or "nonsignificant" in status
+            or "no significant" in direction or "show as non-significant" in eligibility):
+        return "negative", "비유의 결과 — 개선 근거로 사용하지 않음"
+    if ("unverified" in status or "recheck" in status or "context only" in eligibility
+            or "exclude" in eligibility or "ineligible" in eligibility):
+        return "excluded", "원문 확인 또는 직접 기능 근거 부족"
+    if "verified significant" in status and "eligible (verified)" in eligibility:
+        return "verified_db", "기존 DB에서 유의성 확인으로 표시 — 독립 재검증 필요"
+    return "limited", "기존 DB의 제한적 근거 — 비교군·정량값 추가 검증 필요"
 
 
-def attach_screening(rec, screening_rows):
-    """Match variant ID + DOI, then variant name + DOI; never mix different papers."""
-    exact = [s for s in screening_rows if meaningful(rec.get("Variant_ID"))
-             and join_key(rec) == join_key(s)]
-    if exact:
-        return exact
-    return [s for s in screening_rows
-            if value(s.get("Modified_Peptide")).casefold() == value(rec.get("Variant_Name")).casefold()
-            and doi_id(s.get("DOI")) == doi_id(rec.get("DOI"))]
+def variant_key(row):
+    # Keep parent and specific modified/formulation identity separate.
+    return (value(row.get("Parent_Peptide")).casefold(),
+            value(row.get("Variant_Name")).casefold(),
+            value(row.get("Modification_Method")).casefold(),
+            value(row.get("Formulation_Method")).casefold())
 
 
-def variant_key(rec):
-    name = value(rec.get("Variant_Name"))
-    return (name.casefold(), value(rec.get("Modification_Method")).casefold(),
-            value(rec.get("Formulation_Method")).casefold())
+def related_screening(record, screening):
+    rid = value(record.get("Variant_ID"))
+    d = doi(record.get("DOI"))
+    matched = [s for s in screening if value(s.get("Variant_ID")) == rid and rid
+               and doi(s.get("DOI")) == d and d]
+    if not matched:
+        matched = [s for s in screening if value(s.get("Modified_Peptide")).casefold()
+                   == value(record.get("Variant_Name")).casefold() and doi(s.get("DOI")) == d and d]
+    return matched
 
 
-def display_sequence(rec, screenings):
-    if screenings:
-        sequences = [value(x.get("Modified_Sequence")) for x in screenings if meaningful(x.get("Modified_Sequence"))]
-        if sequences:
-            seq = sequences[0]
-            if any(word in seq.lower() for word in ("검증 필요", "확인필요", "별도 표시")):
-                return seq + "  ·  정확한 화학적 구조/서열 검증 필요"
-            return seq
-    return "변형체의 정확한 서열/구조: 확인 필요"
-
-
-def reliable_study_count(recs):
-    return len({identity(r) for r in recs if identity(r)})
-
-
-def summary_assessment(recs):
-    categories = [classification(r)[0] for r in recs]
-    if all(c in {"효과 개선 미입증", "추천 제외 · 맥락"} for c in categories):
-        return "근거 부족"
-    n = reliable_study_count(recs)
-    if n < 2:
-        return "단일 연구 근거 · 독립 재현 필요" if n == 1 else "연구 식별정보 부족"
-    # Multi-paper evidence does not automatically mean concordant or verified evidence.
-    return f"독립 문헌 {n}편 · 결과 일관성 검증 필요"
+def sequence_text(record, screening):
+    for s in screening:
+        if valid(s.get("Modified_Sequence")):
+            return value(s["Modified_Sequence"])
+    return "정확한 변형 서열/구조: 확인 필요"
 
 
 @st.cache_data(show_spinner=False)
-def load_database(db_path, stamp, peptide, function_code):
-    del stamp
-    with sqlite3.connect(db_path) as conn:
-        recs = [json.loads(r[0]) for r in conn.execute(
-            "SELECT payload_json FROM excel_recommendations WHERE peptide_id=? AND function_code=?",
-            (PEPTIDES[peptide], function_code))]
-        screening = [json.loads(r[0]) for r in conn.execute(
-            "SELECT payload_json FROM excel_screening WHERE peptide=? AND function_code=?",
-            (peptide, function_code))]
-        rows = conn.execute(
-            "SELECT screening_json FROM extraction_candidates WHERE peptide=?", (peptide,)).fetchall()
-        automatic = []
-        for (payload,) in rows:
-            record = json.loads(payload)
-            if value(record.get("Target_Function_Code")) == function_code:
-                automatic.append(record)
-        total_papers = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-    return recs, screening, automatic, total_papers
+def load_all(path, modified_ns, byte_size):
+    # Cache refreshed when the SQLite file changes.
+    del modified_ns, byte_size
+    with sqlite3.connect(path) as con:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"excel_recommendations", "excel_screening", "papers", "extraction_candidates"}
+        if not required.issubset(tables):
+            raise ValueError("SQLite schema incomplete; run build_database.py --report")
+        rec = [json.loads(r[0]) for r in con.execute("SELECT payload_json FROM excel_recommendations")]
+        screen = [json.loads(r[0]) for r in con.execute("SELECT payload_json FROM excel_screening")]
+        papers = [dict(zip(("paper_key", "title", "year", "doi", "pmid", "pmcid", "paper_url", "fulltext_status"), r))
+                  for r in con.execute("SELECT paper_key,title,year,doi,pmid,pmcid,paper_url,fulltext_status FROM papers")]
+        links = con.execute("SELECT paper_key,peptide FROM paper_peptides").fetchall()
+        candidates = [dict(zip(("paper_key", "peptide", "source_section", "source_text", "screening_json", "evidence_status"), r))
+                      for r in con.execute("SELECT paper_key,peptide,source_section,source_text,screening_json,evidence_status FROM extraction_candidates")]
+    associated = defaultdict(set)
+    for key, peptide in links:
+        associated[key].add(peptide)
+    for paper in papers:
+        paper["peptides"] = associated[paper["paper_key"]]
+    return rec, screen, papers, candidates
 
 
-def show_paper(record, index=None):
-    title = value(record.get("Reference")) or "원저 제목 확인 필요"
-    year = value(record.get("Year") or record.get("Study_Year"))
-    prefix = f"{index}. " if index is not None else ""
-    st.markdown(f"**{prefix}{title}**" + (f" ({year})" if year else ""))
-    doi = doi_id(record.get("DOI"))
-    url = paper_url(record)
-    if doi:
-        st.caption(f"DOI: {doi}")
+def category_for_candidate(row):
+    try:
+        return value(json.loads(row["screening_json"]).get("Target_Function_Code"))
+    except (ValueError, TypeError):
+        return ""
+
+
+def display_reference(row):
+    name = show(row.get("Reference") or row.get("title"))
+    d = doi(row.get("DOI") or row.get("doi"))
+    url = link(row)
     if url:
-        st.link_button("원문 / DOI 열기", url, key="paper_" + str(index) + "_" + re.sub(r"\W", "", doi or url)[-45:])
+        st.markdown(f"[{name}]({url})" + (f" · DOI `{d}`" if d else ""))
     else:
-        st.caption("원문 링크: 확인 필요")
+        st.write(name)
 
 
 st.set_page_config(page_title="Tissue Regeneration Peptide Navigator", page_icon="🧬", layout="wide")
 st.title("🧬 Tissue Regeneration Peptide Navigator")
-st.caption("기능별 후보를 기존 3차 DB에서 조회합니다. 자동 추출 문장은 별도 검증 전까지 추천에 반영하지 않습니다.")
+st.caption("7종 펩타이드 · 기능 기반 Modification / Formulation 검토 후보 · Europe PMC 문헌 통합 조회")
 
-if not DATABASE.is_file():
-    st.error("navigator.sqlite3가 없습니다. Codespaces에서 DB 생성 후 GitHub에 commit/push했는지 확인하십시오.")
+if not DB_PATH.is_file():
+    st.error("navigator.sqlite3 파일이 없습니다. Codespaces에서 `python build_database.py --all --limit 10`을 실행한 뒤 GitHub에 DB를 업로드하십시오.")
     st.stop()
 
-c1, c2 = st.columns(2)
-with c1:
-    peptide = st.selectbox("기준 펩타이드", list(PEPTIDES))
-with c2:
-    function = st.selectbox("목표 기능", list(FUNCTIONS), format_func=lambda x: FUNCTIONS[x])
+try:
+    stat = DB_PATH.stat()
+    records, screenings, papers, auto = load_all(str(DB_PATH), stat.st_mtime_ns, stat.st_size)
+except (sqlite3.Error, ValueError, KeyError, json.JSONDecodeError) as err:
+    st.error(f"데이터베이스 읽기 실패: {err}")
+    st.stop()
 
-if st.button("기능별 후보 조회", use_container_width=True, type="primary"):
-    try:
-        recs, screening, automatic, paper_total = load_database(
-            str(DATABASE), DATABASE.stat().st_mtime_ns, peptide, function)
-    except (sqlite3.Error, ValueError, KeyError, json.JSONDecodeError) as exc:
-        st.error(f"DB 읽기 실패: {exc}")
-        st.stop()
+left, right = st.columns([1.5, 1])
+with left:
+    function_code = st.selectbox("① 원하는 조직재생 기능", list(FUNCTIONS),
+                                 format_func=lambda x: FUNCTIONS[x])
+with right:
+    scope = st.selectbox("② 검색 범위", ["7종 전체", *PEPTIDES])
+selected = set(PEPTIDES) if scope == "7종 전체" else {scope}
 
-    st.caption(f"기존 추천 {len(recs)}행 · 기존 Screening {len(screening)}행 · 자동 추출 {len(automatic)}문장(미검증) · 전체 수집 논문 {paper_total}편")
-    st.subheader("추천 검토 후보")
-    st.info("표시 순서는 효능 순위가 아닙니다. 검증 완료된 독립 연구가 부족한 후보는 '우선 검토 후보'로만 표시합니다.")
+if st.button("문헌 DB 통합 조회 및 후보 추천", type="primary", use_container_width=True):
+    target_ids = {PEPTIDE_IDS[name] for name in selected}
+    matched = [r for r in records if value(r.get("Target_Function_Code")) == function_code
+               and (value(r.get("Peptide_ID")) in target_ids
+                    or value(r.get("Parent_Peptide")) in selected
+                    or any(pid in value(r.get("Peptide_ID")).split(";") for pid in target_ids))]
+    reference_screening = [s for s in screenings if value(s.get("Target_Function_Code")) == function_code]
+    relevant_papers = [p for p in papers if p["peptides"].intersection(selected)]
+    relevant_auto = [x for x in auto if x["peptide"] in selected and category_for_candidate(x) == function_code]
+    st.caption(f"기존 추천 기록 {len(matched)}건 · 수집된 Europe PMC 원저 후보 {len(relevant_papers)}편(기능 검증 전 포함) · 기능 연관 자동 추출 문장 {len(relevant_auto)}건")
 
-    groups = defaultdict(list)
-    for record in recs:
-        groups[variant_key(record)].append(record)
+    grouped = defaultdict(list)
+    for r in matched:
+        grouped[variant_key(r)].append(r)
+    ranked, excluded = [], []
+    for key, rows in grouped.items():
+        positive = [r for r in rows if kind(r)[0] in {"verified_db", "limited"}]
+        for r in rows:
+            if kind(r)[0] not in {"verified_db", "limited"}:
+                excluded.append(r)
+        if not positive:
+            continue
+        identifiers = {paper_id(r) for r in positive if paper_id(r)}
+        # Priority is for review, not a quantified biological efficacy score.
+        best_label = 1 if any(kind(r)[0] == "verified_db" for r in positive) else 0
+        ranked.append((best_label, len(identifiers), key, positive, rows, identifiers))
+    ranked.sort(key=lambda x: (-x[0], -x[1], x[2]))
 
-    candidate_groups = []
-    excluded_groups = []
-    for key, group in groups.items():
-        usable = [r for r in group if classification(r)[0] in {"검증 필요 후보", "검토 후보"}]
-        if usable:
-            candidate_groups.append((key, usable, group))
-        else:
-            excluded_groups.append((key, group))
+    st.subheader("추천 검토 후보 TOP 1–3")
+    st.info("기존 DB에 등록된 변형·소재화 후보를 비교합니다. 표시 순서는 검토 우선순위이며 효능이 가장 높다는 뜻이 아닙니다. Europe PMC 미검증 문장은 순위에 가산하지 않습니다.")
+    if not ranked:
+        st.warning("현재 조건에서 직접 검토할 수 있는 추천 기록이 부족합니다. 무리하게 후보 3개를 채우지 않습니다.")
 
-    # Stable presentation only; never pretend this order is effect-size ranking.
-    candidate_groups.sort(key=lambda entry: (-reliable_study_count(entry[1]), entry[0][0]))
-    if not candidate_groups:
-        st.warning("현재 목표 기능에 표시할 검토 후보가 없습니다. 근거 없이 3개를 채우지 않습니다.")
-
-    for index, (key, usable, all_records) in enumerate(candidate_groups[:3], start=1):
-        representative = usable[0]
-        connected_screening = []
-        for record in all_records:
-            connected_screening.extend(attach_screening(record, screening))
-        unique_screening = {value(r.get("Record_ID")): r for r in connected_screening}
-        connected_screening = list(unique_screening.values())
-        name = shown(representative.get("Variant_Name"))
+    for rank, (_, distinct, _, supporting, all_rows, ids) in enumerate(ranked[:3], 1):
+        r = supporting[0]
+        parent = show(r.get("Parent_Peptide"))
+        name = show(r.get("Variant_Name"))
+        specific_screen = {}
+        for item in all_rows:
+            for s in related_screening(item, reference_screening):
+                specific_screen[value(s.get("Record_ID"))] = s
+        screen_rows = list(specific_screen.values())
+        # Match collected Europe PMC metadata ONLY by exact DOI of this variant's existing records.
+        linked = [p for p in relevant_papers if doi(p.get("doi"))
+                  and doi(p.get("doi")) in {doi(e.get("DOI")) for e in all_rows}]
         with st.container(border=True):
-            st.markdown(f"### 검토 후보 {index} · {name}")
-            st.caption(summary_assessment(usable))
-            a, b = st.columns([1.3, 1])
+            st.markdown(f"### {rank}. {name}  ·  원형 {parent}")
+            st.caption(f"독립 원저 식별 {distinct}편 · " +
+                       ("독립 재현과 결과 일관성 추가 검증 필요" if distinct >= 2 else "단일 원저 또는 문헌 식별정보 부족"))
+            a, b = st.columns(2)
             with a:
-                st.markdown("**변형 서열/구조**")
-                st.write(display_sequence(representative, connected_screening))
-                st.markdown("**Modification / Formulation**")
-                st.write(shown(representative.get("Modification_Method")))
-                st.write(shown(representative.get("Formulation_Method")))
+                st.markdown("**변형 서열 / 구조 표기**")
+                st.code(sequence_text(r, screen_rows), language=None)
+                st.write("**Modification:**", show(r.get("Modification_Method")))
+                st.write("**Formulation:**", show(r.get("Formulation_Method")))
             with b:
-                st.markdown("**문헌에서 보고된 기능**")
-                st.write(shown(representative.get("Target_Function_EN")) or FUNCTIONS[function])
-                st.markdown("**평가 지표**")
-                st.write(" · ".join(sorted({shown(r.get("Outcome_Metric")) for r in usable})))
-                st.markdown("**독립 원저 수**")
-                st.write(f"{reliable_study_count(usable)}편 (DOI / Study ID 기준, 동일 논문 중복 제외)")
+                st.markdown("**문헌 기반 기대 기능**")
+                st.markdown("#### " + FUNCTIONS[function_code])
+                st.write("**대표 평가 지표:**", ", ".join(sorted({show(x.get("Outcome_Metric")) for x in supporting})))
+                st.write("**근거 분류:**", "기존 DB 확인 항목 포함" if any(kind(x)[0] == "verified_db" for x in supporting) else "제한적 근거")
             st.markdown("**대표 원문**")
-            url = paper_url(representative)
-            st.write(value(representative.get("Reference")) or "서지정보 확인 필요")
-            if url:
-                st.link_button("대표 원문 확인", url, key=f"top_{index}")
-            else:
-                st.caption("대표 원문 링크 확인 필요")
-            with st.expander("더보기 · 실험 근거 / 비교군 / 여러 원문 / 한계"):
-                seen_papers = set()
-                for n, record in enumerate(usable, start=1):
-                    st.markdown(f"**근거 기록 {n}**")
-                    st.write("효과 방향:", shown(record.get("Observed_Direction")))
-                    st.write("비교군:", shown(record.get("Comparator")))
-                    st.write("평가 방법/지표:", shown(record.get("Outcome_Metric")))
-                    st.write("근거 요약:", shown(record.get("Evidence_Detail") or record.get("Short_Summary")))
-                    st.write("통계/검증 상태:", shown(record.get("Evidence_Status")))
-                    st.write("한계:", shown(record.get("Limitations")))
-                    ident = identity(record)
-                    if ident and ident not in seen_papers:
-                        seen_papers.add(ident)
-                        st.markdown("원문: " + (f"[링크]({paper_url(record)})" if paper_url(record) else "확인 필요"))
+            display_reference(r)
+            with st.expander("더보기 — 실험 조건·비교군·정량 결과·전체 원문·한계"):
+                for j, x in enumerate(all_rows, 1):
+                    st.markdown(f"**기존 DB 실험 기록 {j} · {kind(x)[1]}**")
+                    st.write("평가 지표:", show(x.get("Outcome_Metric")))
+                    st.write("효과 방향:", show(x.get("Observed_Direction")))
+                    st.write("비교군:", show(x.get("Comparator")))
+                    st.write("근거 설명:", show(x.get("Evidence_Detail") or x.get("Short_Summary")))
+                    st.write("한계:", show(x.get("Limitations")))
+                    display_reference(x)
                     st.divider()
-                if connected_screening:
-                    st.markdown("**기존 Screening DB 원자료**")
-                    cols = ["Modified_Peptide", "Modified_Sequence", "Evaluation_Method", "Quantitative_Result",
-                            "Statistical_Significance", "Comparator", "DOI", "Source_Verification"]
-                    st.dataframe(pd.DataFrame(connected_screening).reindex(columns=cols), use_container_width=True, hide_index=True)
-                if len(seen_papers) < 2:
-                    st.warning("독립 원저가 2편 미만입니다. 단일 논문의 여러 실험 기록을 반복 재현 근거로 계산하지 않습니다.")
+                if screen_rows:
+                    st.markdown("**기존 Screening DB 원자료 (정량 결과·통계 확인용)**")
+                    columns = ["Modified_Peptide", "Modified_Sequence", "Evaluation_Method", "Quantitative_Result",
+                               "Statistical_Significance", "Comparator", "Source_Verification", "DOI"]
+                    st.dataframe(pd.DataFrame(screen_rows).reindex(columns=columns), hide_index=True, use_container_width=True)
+                st.markdown("**Europe PMC 연계 원문 (기존 DB와 DOI가 일치하는 경우)**")
+                if linked:
+                    for p in linked:
+                        display_reference(p)
+                        st.caption("Europe PMC 수집 메타데이터 연결 · 독립적인 추가 재현 근거로 중복 계산하지 않음")
+                else:
+                    st.caption("이번 수집 범위 내에서 DOI가 일치하는 추가 메타데이터 없음")
 
-    with st.expander("추천에 사용하지 않은 근거 · 제외 사유와 다음 검증 작업", expanded=False):
-        st.write("비유의 결과, 직접 효능이 불명확한 결과, 비교군이 섞인 결과는 삭제하지 않고 분리 보관합니다.")
-        excluded_rows = []
-        for _, group in excluded_groups:
-            for record in group:
-                c, reason = classification(record)
-                excluded_rows.append({
-                    "변형체": shown(record.get("Variant_Name")), "분류": c, "사유": reason,
-                    "관찰 결과": shown(record.get("Observed_Direction")),
-                    "DOI": doi_id(record.get("DOI")),
-                    "다음 작업": "원저·비교군·통계값 검토 후 상태 갱신",
-                })
-        if excluded_rows:
-            st.dataframe(pd.DataFrame(excluded_rows), use_container_width=True, hide_index=True)
+    st.subheader("Europe PMC 추가 문헌 탐색 결과")
+    st.caption("7종 전체(또는 선택한 펩타이드)에서 수집된 논문입니다. 기능에 대한 실제 효능·변형체 일치는 아직 검증되지 않았습니다.")
+    search_phrase = st.text_input("수집 논문 제목/DOI 검색", placeholder="예: GHK, hydrogel, angiogenesis", key="paper_query")
+    shown_papers = [p for p in relevant_papers if not search_phrase or search_phrase.lower() in (p["title"] + " " + value(p["doi"])).lower()]
+    if shown_papers:
+        paper_table = [{"펩타이드(검색 연결)": ", ".join(sorted(p["peptides"])), "논문": p["title"],
+                        "연도": p["year"], "DOI": p["doi"], "원문 링크": p["paper_url"],
+                        "원문 XML": p["fulltext_status"]} for p in shown_papers]
+        st.dataframe(pd.DataFrame(paper_table), use_container_width=True, hide_index=True,
+                     column_config={"원문 링크": st.column_config.LinkColumn("원문 링크")})
+    else:
+        st.info("저장된 해당 펩타이드의 신규 논문이 없습니다. Codespaces에서 `python build_database.py --all --limit 10`을 실행하고 SQLite를 GitHub에 push하십시오.")
+
+    with st.expander("추천에 사용하지 않은 근거 / 미검증 추출 문장", expanded=False):
+        st.markdown("**기존 DB에서 제외된 결과**")
+        if excluded:
+            st.dataframe(pd.DataFrame([{"원형": x.get("Parent_Peptide"), "변형체": x.get("Variant_Name"),
+                                       "사유": kind(x)[1], "관찰 결과": x.get("Observed_Direction"),
+                                       "DOI": x.get("DOI")} for x in excluded]),
+                         hide_index=True, use_container_width=True)
         else:
-            st.caption("현재 조건에서 제외된 기존 추천 기록은 없습니다.")
-        st.markdown("**자동 추출된 미검증 근거**")
-        st.write(f"{len(automatic)}문장 · 모두 추천 및 독립 원저 수 계산에서 제외")
-        if automatic:
-            columns = ["Original_Peptide", "Candidate_Statement", "Source_Verification", "DOI", "Evidence_Status"]
-            table = pd.DataFrame(automatic).reindex(columns=columns)
-            st.dataframe(table, use_container_width=True, hide_index=True)
-            st.download_button("미검증 근거 CSV 다운로드", table.to_csv(index=False).encode("utf-8-sig"),
-                               "unverified_evidence.csv", "text/csv")
-        st.caption("검증 작업: (1) 해당 peptide intervention 확인 → (2) 결과 지표 및 비교군 연결 → (3) 정량값/p-value 확인 → (4) DOI 중복 검사 → (5) 유효 근거로 승격")
+            st.caption("현재 조건에서 분류된 제외 기록 없음")
+        st.markdown(f"**Europe PMC 자동 추출 문장 — {len(relevant_auto)}건, 전부 미검증**")
+        if relevant_auto:
+            rows = []
+            for x in relevant_auto:
+                info = json.loads(x["screening_json"])
+                rows.append({"펩타이드": x["peptide"], "기능": info.get("Target_Function_Code"),
+                             "문장": x["source_text"], "출처": x["source_section"],
+                             "DOI": info.get("DOI"), "상태": x["evidence_status"]})
+            frame = pd.DataFrame(rows)
+            st.dataframe(frame, hide_index=True, use_container_width=True)
+            st.download_button("미검증 문장 CSV 받기", frame.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="unverified_extraction.csv", mime="text/csv")
+        else:
+            st.caption("선택한 기능과 연결된 미검증 문장이 없습니다.")
+        st.warning("검증 절차: 해당 변형체 → 해당 실험군/비교군 → 효과 방향 → 정량값/p값 → 원저 식별정보의 일치 여부 확인 후 수동 또는 검증된 파이프라인으로 승격")
 
-    if len(candidate_groups) > 3:
-        st.caption(f"추가 검토 후보 {len(candidate_groups)-3}개는 이번 화면에서 표시하지 않았습니다. 화면의 3개는 임시 효능 순위가 아닙니다.")
+    if len(ranked) > 3:
+        with st.expander(f"추가 검토 가능한 변형체 {len(ranked)-3}개 보기"):
+            st.dataframe(pd.DataFrame([{"원형": show(x[3][0].get("Parent_Peptide")),
+                                       "변형체": show(x[3][0].get("Variant_Name")),
+                                       "독립 원저 식별": x[1]} for x in ranked[3:]]),
+                         use_container_width=True, hide_index=True)
+
+st.divider()
+st.caption("문헌 원본: 기존 3차 DB + Europe PMC API. 새 논문은 build_database.py로 수집하며, Streamlit 화면은 SQLite를 읽기만 합니다. 동일 DOI 중복 결과와 검증 전 문장으로 추천 확신도를 높이지 않습니다.")
